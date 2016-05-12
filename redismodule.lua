@@ -19,7 +19,6 @@ typedef struct RedisModuleCallReply RedisModuleCallReply;
 typedef int (*RedisModuleCmdFunc) (RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 
 int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc cmdfunc, const char *strflags, int firstkey, int lastkey, int keystep);
-int RM_SetModuleAttribs(RedisModuleCtx *ctx, const char *name, int ver, int apiver);
 int RM_WrongArity(RedisModuleCtx *ctx);
 int RM_ReplyWithLongLong(RedisModuleCtx *ctx, long long ll);
 int RM_GetSelectedDb(RedisModuleCtx *ctx);
@@ -86,8 +85,17 @@ RedisModuleCtx* RM_LJ_GetEvalContext(void);
 ]])
 
 local C = ffi.C
-local ffi_new = ffi.new
+local ffi_new, ffi_gc, ffi_string = ffi.new, ffi.gc, ffi.string
+local select, type = select, type
+
 local RM_LJ = ffi.load('redis-mod_luajit', true)
+local RM_OK = 0
+local RM_ERR = 1
+
+local int_1_t    = ffi.typeof('int[1]')
+local size_1_t   = ffi.typeof('size_t[1]')
+local ll_1_t     = ffi.typeof('long long[1]')
+local double_1_t = ffi.typeof('double[1]')
 
 
 -- RedisModule Lua API
@@ -161,9 +169,6 @@ RM.Ctx = ffi.metatype( 'RedisModuleCtx', {
         CreateCommand = function(ctx, name, cmdfunc, strflags, firstkey, lastkey, keystep)
             return C.RM_CreateCommand(ctx, name, cmdfunc, strflags, firstkey, lastkey, keystep)
         end,
-        SetModuleAttribs = function(ctx, name, ver, apiver)
-            return C.RM_SetModuleAttribs(ctx, name, ver, apiver)
-        end,
         WrongArity = function(ctx)
             return C.RM_WrongArity(ctx)
         end,
@@ -189,10 +194,13 @@ RM.Ctx = ffi.metatype( 'RedisModuleCtx', {
             return C.RM_ReplySetArrayLength(ctx, len)
         end,
         ReplyWithStringBuffer = function(ctx, buf, len)
-            -- TODO
+            return C.RM_ReplyWithStringBuffer(ctx, buf, len)
         end,
         ReplyWithString = function(ctx, str)
-            -- TODO
+            if type(str) == 'string' then
+                str = RM.String(str)
+            end
+            return C.RM_ReplyWithStringBuffer(ctx, str)
         end,
         ReplyWithNull = function(ctx)
             return C.RM_ReplyWithNull(ctx)
@@ -201,14 +209,13 @@ RM.Ctx = ffi.metatype( 'RedisModuleCtx', {
             return C.RM_ReplyWithNull(ctx, d)
         end,
         ReplyWithCallReply = function(ctx, reply)
-            -- TODO
+            return C.RM_ReplyWithCallReply(ctx, reply)
         end,
         AutoMemory = function(ctx)
             C.RM_AutoMemory(ctx)
         end,
-        Replicate = function(ctx, cmdname, fmt) -- , ...)
-            -- TODO
-        end,
+        -- TODO Replicate = function(ctx, cmdname, fmt) -- , ...)
+        --end,
         ReplicateVerbatim = function(ctx)
             return C.RM_ReplicateVerbatim(ctx)
         end,
@@ -216,10 +223,15 @@ RM.Ctx = ffi.metatype( 'RedisModuleCtx', {
             return C.RM_IsKeysPositionRequest(ctx)
         end,
         KeyAtPos = function(ctx, pos)
-            -- TODO
+            C.RM_KeyAtPos(ctx, pos)
         end,
         GetClientId = function(ctx)
             return C.RM_GetClientId(ctx)
+        end,
+        Call = function(ctx, cmdname, fmt, ...)
+            local narg = select("#", ...)
+            local reply = C.RM_Call(ctx, cmdname, fmt, ...)
+            return reply
         end,
     }
 })
@@ -229,11 +241,7 @@ RM.Ctx = ffi.metatype( 'RedisModuleCtx', {
 RM.Key = ffi.metatype( 'struct RedisModuleKey', {
 
     -- garbage collection destructor, not invoked by user
-    __gc = function(key)
-        if key then
-            C.RM_CloseKey(key)
-        end
-    end,
+    __gc = C.RM_CloseKey,
 
     -- methods
     __index = {
@@ -243,15 +251,29 @@ RM.Key = ffi.metatype( 'struct RedisModuleKey', {
         ValueLength = function(key)
             return C.RM_ValueLength(key)
         end,
-        ListPush = function(key, where, ele) -- TODO ele => string
-            return C.RM_ListPush(key, where, ele)
+        ListPush = function(key, where, elem)
+            if type(elem) == 'string' then
+                elem = RM.String(elem)
+            end
+            return C.RM_ListPush(key, where, elem)
         end,
-        --RedisModuleString *RM_ListPop(key, int where);
+        ListPop = function(key, where)
+            local elem = C.RM_ListPush(pop, where)
+            return elem and ffi_gc(elem, C.RM_FreeString) or nil
+        end,
         DeleteKey = function(key)
             return C.RM_DeleteKey(key)
         end,
-        -- int RM_StringSet(key, RedisModuleString *str);
-        -- char *RM_StringDMA(key, size_t *len, int mode);
+        StringSet = function(key, str)
+            return C.RM_StringSet(key, str)
+        end,
+        -- returns char*, size_t (ptr, len) for DMA access
+        -- mode should be RM.READ, RM.WRITE, or RM.READ+RM.WRITE
+        StringDMA = function(key, mode)
+            local len_1 = size_1_t()
+            local ptr = C.RM_StringDMA(key, len_1, mode)
+            return ptr, len_1[0]
+        end,
         StringTruncate = function(key, newlen)
             return C.RM_StringTruncate(key, newlen)
         end,
@@ -261,14 +283,30 @@ RM.Key = ffi.metatype( 'struct RedisModuleKey', {
         SetExpire = function(key, expire)
             return C.RM_SetExpire(expire)
         end,
-        -- ZsetAdd = function(key, double score, RedisModuleString *ele, int *flagsptr)
-        -- end,
-        -- ZsetIncrby = function(key, double score, RedisModuleString *ele, int *flagsptr, double *newscore)
-        -- end,
-        -- ZsetScore = function(key, RedisModuleString *ele, double *score)
-        -- end,
-        -- ZsetRem = function(key, RedisModuleString *ele, int *deleted)
-        -- end,
+        -- returns result, outflags
+        ZsetAdd = function(key, score, elem, flags)
+            local flags_1 = int_1_t(flags or 0)
+            local res = C.RM_ZsetAdd(key, score, elem, flags_1)
+            return res, flags_1[0]
+        end,
+        -- returns result, outflags, newscore
+        ZsetIncrby = function(key, score, elem, flags)
+            local flags_1 = int_1_t(flags or 0)
+            local newscore_1 = double_1_t()
+            local res = C.RM_ZsetIncrby(key, score, elem, flags_1, newscore_1)
+            return res, flags_1[0], newscore_1[0]
+        end,
+        -- returns result, score
+        ZsetScore = function(key, elem, score)
+            local score_1 = double_1_t()
+            local res = C.RM_ZsetIncrby(key, elem, score_1)
+            return res, score_1[0]
+        end,
+        ZsetRem = function(key, elem)
+            local deleted_1 = int_1_t()
+            local res = C.RM_ZsetRem(key, elem, deleted_1)
+            return res, deleted_1[0]
+        end,
         ZsetRangeStop = function(key)
             return C.RM_ZsetRangeStop(key)
         end,
@@ -284,8 +322,12 @@ RM.Key = ffi.metatype( 'struct RedisModuleKey', {
         ZsetLastInLexRange = function(key, min, max)
             return C.RM_ZsetLastInLexRange(key, min, max)
         end,
-        -- RedisModuleString = function *RM_ZsetRangeCurrentElement(key, double *score)
-        -- end,
+        -- returns RM.String, score
+        ZsetRangeCurrentElement = function(key)
+            local score_1 = double_1_t()
+            local str = C.RM_ZsetRangeCurrentElement(key, score_1)
+            return str, score_1[0]
+        end,
         ZsetRangeNext = function(key)
             return C.RM_ZsetRangeNext(key)
         end,
@@ -307,66 +349,67 @@ RM.Key = ffi.metatype( 'struct RedisModuleKey', {
 
 --- RedisModule String class 
 RM.String = ffi.metatype( 'struct RedisModuleString', {
-
-        --RedisModuleString *RM_CreateString(RedisModuleCtx *ctx, const char *ptr, size_t len);
-        --RedisModuleString *RM_CreateStringFromLongLong(RedisModuleCtx *ctx, long long ll);
-        --void RM_FreeString(RedisModuleCtx *ctx, RedisModuleString *str);
-        --const char *RM_StringPtrLen(RedisModuleString *str, size_t *len);
-        --const char *RM_StringPtrLen(RedisModuleString *str, size_t *len);
-
-    --- Construct a new String object
-    -- __new = function(str_ct, str_ptr)
-    -- end,
-
-    -- garbage collection destructor, not invoked by user
-    -- __gc = function(str)
-    --     if str then
-    --         C.RM_FreeString()  -- TODO need context
-    --     end
-    -- end,
-
     -- methods
     __index = {
-    --  Convert the string into a long long integer, storing it at *ll. Returns REDISMODULE_OK on success. If the string can't be parsed as a valid, strict long long (no spaces before/after), REDISMODULE_ERR is returned.
-    --    ToLongLong = function(str)
-    --        return C.RM_StringToLongLong()
-    --    end,
-    --    -- StringToDouble = function(str)
-    --    -- end,
-    }
+        -- Returns the string converted into a long long integer.
+        -- Returns `nil` if the string can't be parsed as a valid, strict long long (no spaces before/after).
+        ToLongLong = function(str)
+            local ll_1 = ll_1_t()
+            local res = C.RM_StringToLongLong(str, ll_1)
+            return (res == RM_OK) and ll_1[0] or nil
+        end,
+        -- Returns the string converted into a Lua number.
+        -- Returns `nil` if the string is not a valid string representation of a double value.
+        ToDouble = function(str)
+            local double_1 = double_1_t()
+            local res = C.RM_StringToDouble(str, double_1)
+            return (res == RM_OK) and double_1[0] or nil
+        end,
+        -- Returns the const char*, size_t (ptr, len) of the String.
+        PtrLen = function(str)
+            local len_1 = size_1_t()
+            local ptr = C.RM_StringPtrLen(str, len_1)
+            return ptr, len_1[0]
+        end,
+    },
+
+    -- Creates a Lua string from this String
+    __tostring = function(str)
+        local len_1 = size_1_t()
+        local ptr = C.RM_StringPtrLen(str, len_1)
+        return ffi_string(ptr, len_1[0])
+    end
 })
 
 
---- RedisModule String class 
+--- RedisModule CallReply class 
 RM.CallReply = ffi.metatype( 'struct RedisModuleCallReply', {
-
--- const char *RM_CallReplyProto(RedisModuleCallReply *reply, size_t *len);
--- int RM_CallReplyType(RedisModuleCallReply *reply);
--- long long RM_CallReplyInteger(RedisModuleCallReply *reply);
--- RedisModuleCallReply *RM_CallReplyArrayElement(RedisModuleCallReply *reply, size_t idx);
--- const char *RM_CallReplyStringPtr(RedisModuleCallReply *reply, size_t *len);
--- RedisModuleString *RM_CreateStringFromCallReply(RedisModuleCallReply *reply);
-
-    --- Construct a new CallReply object
-    --__new = function(reply_ct, reply_ptr)
-    --    -- TODO
-    --end,
-
-    -- garbage collection destructor, not invoked by user
-    --__gc = function(reply)
-    --    if reply then
-    --        C.RM_FreeCallReply(reply)
-    --    end
-    --end,
-
     -- methods
     __index = {
---    Convert the string into a long long integer, storing it at *ll. Returns REDISMODULE_OK on success. If the string can't be parsed as a valid, strict long long (no spaces before/after), REDISMODULE_ERR is returned.
-        -- ToLongLong = function(str)
-        --     return C.RM_StringToLongLong()
-        -- end,
+        Index = function(reply, idx)
+            return C.RM_CallReplyArrayElement(reply, idx)
+        end,
+        ArrayElement = function(reply, idx)
+            return C.RM_CallReplyArrayElement(reply, idx)
+        end,
         Length = function(reply)
             return C.RM_CallReplyLength(reply)
+        end,
+        Type = function(reply)
+            return C.RM_CallReplyType(reply)
+        end,
+        Integer = function(reply)
+            return C.RM_CallReplyInteger(reply)
+        end,
+        -- returns const char*, size_t of this CallReply
+        Proto = function(reply)
+            local len_1 = size_1_t()
+            local ptr = C.RM_CallReplyProto(reply, len_1)
+            return ptr, len_1[0]
+        end,
+        -- returns a RM.String from this CallReply
+        String = function(reply)
+            return C.RM_CreateStringFromCallReply(reply)
         end,
     }
 })
